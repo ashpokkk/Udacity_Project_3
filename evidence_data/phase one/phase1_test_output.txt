@@ -1,0 +1,9 @@
+Running local agent test...
+Traceback (most recent call last):
+  File "D:\Project 3\src\agent_orchestrator.py", line 1156, in <module>
+    print(f"\n{'\u2500'*60}")
+    ~~~~~^^^^^^^^^^^^^^^
+  File "C:\Users\Doctor Computers\AppData\Roaming\uv\python\cpython-3.14-windows-x86_64-none\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 2-61: character maps to <undefined>
