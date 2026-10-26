@@ -271,9 +271,19 @@ def _update_workflow_state(session_id: str, updates: dict,
 #  2.A - INVENTORY AGENT
 # ───────────────────────────────────────────────────────
 
+def _apply_guardrail(model_id, temperature):
+    """Create a model with the configured guardrail attached."""
+    return BedrockModel(
+        model_id=model_id,
+        temperature=temperature,
+        guardrail_id=os.environ.get("GUARDRAIL_ID"),
+        guardrail_version=os.environ.get("GUARDRAIL_VERSION"),
+    )
+
+
 def build_inventory_agent() -> Agent:
     """Build an Inventory Agent that retrieves order and customer facts."""
-    model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.1)
+    model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.1)
     system_prompt = (
         "You are NovaMart's Inventory Agent. Retrieve facts from the available tools; "
         "do not decide refund eligibility or invent missing data. Clearly report when "
@@ -326,7 +336,7 @@ def build_inventory_agent() -> Agent:
 
 def build_refund_agent() -> Agent:
     """Build a Refund Agent that checks return eligibility and records return requests."""
-    model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.1)
+    model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.1)
     system_prompt = (
         "You are NovaMart's Refund Agent. ALWAYS call get_inventory_context first and use "
         "the inventory findings in WorkflowState before making a decision. Verify order "
@@ -423,7 +433,7 @@ def build_refund_agent() -> Agent:
 
 def build_policy_agent() -> Agent:
     """Build a coordinator that queries Returns, Shipping, and Warranty KBs in parallel."""
-    retriever_model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0)
+    retriever_model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.0)
 
     @tool
     def retrieve_returns_policy(query: str) -> str:
@@ -499,7 +509,7 @@ def build_policy_agent() -> Agent:
             for domain in ("Returns", "Shipping", "Warranty")
         )
 
-    coordinator_model = BedrockModel(
+    coordinator_model = _apply_guardrail(
         model_id=config.WORKER_MODEL_ID, temperature=0.2
     )
     coordinator_prompt = (
@@ -513,7 +523,7 @@ def build_policy_agent() -> Agent:
 
 def build_communication_agent() -> Agent:
     """Build the agent that composes the final customer-facing response."""
-    model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.3)
+    model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.3)
     system_prompt = (
         "You are NovaMart's customer communication specialist. First read the full "
         "WorkflowState using get_full_workflow_context. Compose a concise, empathetic "
@@ -544,7 +554,7 @@ def build_orchestrator_agent(
     communication_agent: Agent,
 ) -> Agent:
     """Build the Orchestrator that routes work and manages shared WorkflowState."""
-    model = BedrockModel(model_id=config.ORCHESTRATOR_MODEL_ID, temperature=0.0)
+    model = _apply_guardrail(model_id=config.ORCHESTRATOR_MODEL_ID, temperature=0.0)
     system_prompt = (
         "You are NovaMart's Orchestrator. You NEVER write the final customer-facing answer. "
         "Follow these routing rules exactly: (1) call initialize_session first for every request. "
@@ -815,16 +825,6 @@ def deploy_to_agentcore_runtime(
 
     runtime_name = f"{config.PROJECT_NAME}-runtime".replace('-', '_')
 
-    # Check if runtime already exists
-    try:
-        existing = agentcore_control.list_agent_runtimes()
-        for r in existing.get('agentRuntimes', []):
-            if r['agentRuntimeName'] == runtime_name:
-                runtime_arn = r['agentRuntimeArn']
-                print(f"AgentCore Runtime already exists: {runtime_arn}")
-                return runtime_arn
-    except Exception as e:
-        print(f"  [Note] Could not check existing runtimes: {e}")
 
     # ── Stage the app in build/runtime/ ───────────────────
     src_dir = os.path.dirname(os.path.abspath(__file__))

@@ -52,7 +52,9 @@ from boto3.dynamodb.conditions import Key
 
 import config
 from bedrock_kb_retrieval import retrieve_from_knowledge_base, format_kb_results
-from agent_observability import apply_observability_config
+from agent_observability import (
+    apply_observability_config, start_request, traced_node, finish_request,
+)
 
 # Configure logging for debugging
 logging.basicConfig(
@@ -269,9 +271,19 @@ def _update_workflow_state(session_id: str, updates: dict,
 #  2.A - INVENTORY AGENT
 # ───────────────────────────────────────────────────────
 
+def _apply_guardrail(model_id, temperature):
+    """Create a model with the configured guardrail attached."""
+    return BedrockModel(
+        model_id=model_id,
+        temperature=temperature,
+        guardrail_id=os.environ.get("GUARDRAIL_ID"),
+        guardrail_version=os.environ.get("GUARDRAIL_VERSION"),
+    )
+
+
 def build_inventory_agent() -> Agent:
     """Build an Inventory Agent that retrieves order and customer facts."""
-    model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.1)
+    model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.1)
     system_prompt = (
         "You are NovaMart's Inventory Agent. Retrieve facts from the available tools; "
         "do not decide refund eligibility or invent missing data. Clearly report when "
@@ -324,13 +336,14 @@ def build_inventory_agent() -> Agent:
 
 def build_refund_agent() -> Agent:
     """Build a Refund Agent that checks return eligibility and records return requests."""
-    model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.1)
+    model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.1)
     system_prompt = (
         "You are NovaMart's Refund Agent. ALWAYS call get_inventory_context first and use "
         "the inventory findings in WorkflowState before making a decision. Verify order "
         "ownership and the order date; Standard customers have a 30-day return window and "
         "Premium customers have a 60-day window. Never claim a refund was initiated "
-        "unless the tool confirms it. Explain missing or invalid information."
+        "unless the tool confirms it. Explain missing or invalid information. If the "
+        "customer gave no reason, use 'Customer requested a return' and continue; never ask for one."
     )
 
     @tool
@@ -420,7 +433,7 @@ def build_refund_agent() -> Agent:
 
 def build_policy_agent() -> Agent:
     """Build a coordinator that queries Returns, Shipping, and Warranty KBs in parallel."""
-    retriever_model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.0)
+    retriever_model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.0)
 
     @tool
     def retrieve_returns_policy(query: str) -> str:
@@ -471,7 +484,8 @@ def build_policy_agent() -> Agent:
 
         def _run_retriever(domain: str, agent, question: str) -> tuple:
             try:
-                result = agent(question)
+                with traced_node(f"KnowledgeBase:{domain}"):
+                    result = agent(question)
                 return domain, str(result)
             except Exception as exc:
                 logger.exception("%s policy retrieval failed", domain)
@@ -495,7 +509,7 @@ def build_policy_agent() -> Agent:
             for domain in ("Returns", "Shipping", "Warranty")
         )
 
-    coordinator_model = BedrockModel(
+    coordinator_model = _apply_guardrail(
         model_id=config.WORKER_MODEL_ID, temperature=0.2
     )
     coordinator_prompt = (
@@ -509,12 +523,15 @@ def build_policy_agent() -> Agent:
 
 def build_communication_agent() -> Agent:
     """Build the agent that composes the final customer-facing response."""
-    model = BedrockModel(model_id=config.WORKER_MODEL_ID, temperature=0.3)
+    model = _apply_guardrail(model_id=config.WORKER_MODEL_ID, temperature=0.3)
     system_prompt = (
         "You are NovaMart's customer communication specialist. First read the full "
         "WorkflowState using get_full_workflow_context. Compose a concise, empathetic "
         "and accurate response based only on recorded findings. Do not invent actions "
-        "or promise a refund unless the state confirms it."
+        "or promise a refund unless the state confirms it. For price math, do not round "
+        "the discount before subtracting it; keep exact values and round only the final "
+        "total to cents (half up). Example: 5 x $29.99 with 10% off = $149.95 - $14.995 "
+        "= $134.955, which is $134.96."
     )
 
     @tool
@@ -537,7 +554,7 @@ def build_orchestrator_agent(
     communication_agent: Agent,
 ) -> Agent:
     """Build the Orchestrator that routes work and manages shared WorkflowState."""
-    model = BedrockModel(model_id=config.ORCHESTRATOR_MODEL_ID, temperature=0.0)
+    model = _apply_guardrail(model_id=config.ORCHESTRATOR_MODEL_ID, temperature=0.0)
     system_prompt = (
         "You are NovaMart's Orchestrator. You NEVER write the final customer-facing answer. "
         "Follow these routing rules exactly: (1) call initialize_session first for every request. "
@@ -549,11 +566,21 @@ def build_orchestrator_agent(
         "(6) Math/calculation requests: skip InventoryAgent, PolicyAgent, and RefundAgent. "
         "For EVERY request, call route_to_communication_agent as your final tool call, "
         "after all other needed work; no tools may be called after it. Pass session_id and "
-        "customer_id exactly as supplied."
+        "customer_id exactly as supplied. Call each route tool at most once per request. "
+        "If a worker agent asks a question or cannot finish, do not stop: still call "
+        "route_to_communication_agent. After route_to_communication_agent returns, "
+        "repeat its text exactly as your reply, and add nothing."
     )
 
     def _worker_result(agent: Agent, prompt: str) -> str:
-        return str(agent(prompt))
+        names = {
+            id(inventory_agent): "InventoryAgent",
+            id(policy_agent): "PolicyAgent",
+            id(refund_agent): "RefundAgent",
+            id(communication_agent): "CommunicationAgent",
+        }
+        with traced_node(names.get(id(agent), "WorkerAgent")):
+            return str(agent(prompt))
 
     def _write_result(session_id: str, field: str, value) -> dict:
         state = _read_workflow_state(session_id)
@@ -798,16 +825,6 @@ def deploy_to_agentcore_runtime(
 
     runtime_name = f"{config.PROJECT_NAME}-runtime".replace('-', '_')
 
-    # Check if runtime already exists
-    try:
-        existing = agentcore_control.list_agent_runtimes()
-        for r in existing.get('agentRuntimes', []):
-            if r['agentRuntimeName'] == runtime_name:
-                runtime_arn = r['agentRuntimeArn']
-                print(f"AgentCore Runtime already exists: {runtime_arn}")
-                return runtime_arn
-    except Exception as e:
-        print(f"  [Note] Could not check existing runtimes: {e}")
 
     # ── Stage the app in build/runtime/ ───────────────────
     src_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1252,8 +1269,10 @@ if __name__ == '__main__':
             print(f"Session: {session_id} | Customer: {customer_id}")
             print(f"Query: {query}")
             prompt = f"[Session ID: {session_id}] [Customer ID: {customer_id}] {query}"
+            start_request()
             response = orchestrator(prompt)
             print(f"Response: {response}")
+            finish_request()
 
     elif len(sys.argv) > 1 and sys.argv[1] == 'chat':
         # ── Interactive terminal chat - educational mode ───────────────────

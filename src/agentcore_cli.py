@@ -64,24 +64,43 @@ def deploy():
                   Body=buffer.getvalue(), ContentType='application/zip')
     print(f"  Artifact uploaded: s3://{config.POLICY_BUCKET}/{key}")
 
-    # 3) Create the runtime
-    response = ctrl.create_agent_runtime(
-        agentRuntimeName=_settings['name'],
-        description=f"{config.PROJECT_NAME} orchestration runtime",
-        roleArn=_settings['role_arn'],
-        networkConfiguration={'networkMode': _settings['network_mode']},
-        protocolConfiguration={'serverProtocol': _settings['protocol']},
-        agentRuntimeArtifact={
-            'codeConfiguration': {
-                'code': {'s3': {'bucket': config.POLICY_BUCKET, 'prefix': key}},
-                'runtime': 'PYTHON_3_12',
-                'entryPoint': [_settings['entrypoint']],
-            }
-        },
-        environmentVariables=_settings['env_vars'],
-    )
-    _settings['arn'] = response.get('agentRuntimeArn', response.get('arn', ''))
-    runtime_id = response['agentRuntimeId']
+    # 3) Create the runtime, or update it if it already exists
+    artifact = {
+        'codeConfiguration': {
+            'code': {'s3': {'bucket': config.POLICY_BUCKET, 'prefix': key}},
+            'runtime': 'PYTHON_3_12',
+            'entryPoint': [_settings['entrypoint']],
+        }
+    }
+    existing = next(
+        (r for r in ctrl.list_agent_runtimes().get('agentRuntimes', [])
+         if r['agentRuntimeName'] == _settings['name']), None)
+
+    if existing:
+        runtime_id = existing['agentRuntimeId']
+        ctrl.update_agent_runtime(
+            agentRuntimeId=runtime_id,
+            description=f"{config.PROJECT_NAME} orchestration runtime",
+            roleArn=_settings['role_arn'],
+            networkConfiguration={'networkMode': _settings['network_mode']},
+            protocolConfiguration={'serverProtocol': _settings['protocol']},
+            agentRuntimeArtifact=artifact,
+            environmentVariables=_settings['env_vars'],
+        )
+        _settings['arn'] = existing['agentRuntimeArn']
+        print(f"  Updating existing runtime: {runtime_id}")
+    else:
+        response = ctrl.create_agent_runtime(
+            agentRuntimeName=_settings['name'],
+            description=f"{config.PROJECT_NAME} orchestration runtime",
+            roleArn=_settings['role_arn'],
+            networkConfiguration={'networkMode': _settings['network_mode']},
+            protocolConfiguration={'serverProtocol': _settings['protocol']},
+            agentRuntimeArtifact=artifact,
+            environmentVariables=_settings['env_vars'],
+        )
+        _settings['arn'] = response.get('agentRuntimeArn', response.get('arn', ''))
+        runtime_id = response['agentRuntimeId']
 
     # 4) Wait until the runtime is READY
     print("  Waiting for runtime to become READY", end='', flush=True)
