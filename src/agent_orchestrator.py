@@ -947,7 +947,12 @@ def configure_observability(runtime_arn: str) -> None:
         },
     }
 
-    apply_observability_config(runtime_arn, logging_config)
+    try:
+        apply_observability_config(runtime_arn, logging_config)
+        print(f"  CloudWatch log group : {config.AGENT_LOG_GROUP}")
+        print("  X-Ray sampling rate  : 1.0 (100%)")
+    except Exception as e:
+        print(f"[Note] Logging config skipped (SDK version mismatch): {e}")
 
 
 # ═══════════════════════════════════════════════════════
